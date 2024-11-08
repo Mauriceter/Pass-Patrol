@@ -1,6 +1,5 @@
 import os
-import json
-import shutil
+import re
 import pdfplumber
 from docx import Document
 import openpyxl
@@ -9,14 +8,17 @@ from odf.opendocument import load as load_odt
 from odf.text import P
 import xlrd  # For handling .xls files
 import argparse
-import threading
-from queue import Queue
 import datetime
-import re
 import warnings
+import shutil
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import ollama
+
 
 # ANSI escape code 
 RED_TEXT = '\033[91m'
+PURPLE_TEXT = '\033[35m'
 BOLD_TEXT = "\033[1m"
 RESET_TEXT = '\033[0m'
 
@@ -25,15 +27,12 @@ timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 download_folder = f"downloaded_files_{timestamp}"
 os.makedirs(download_folder, exist_ok=True)
 
+# Initialize the JSON report dictionary
+json_report = {}
+
 # Global variable for debug mode
 debug = False
-out = False
-# Path to the script's directory
-script_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Default paths for keywords and extensions
-default_keywords_path = os.path.join(script_dir, "keywords.txt")
-default_extensions_path = os.path.join(script_dir, "blacklist.txt")
+interesting_filenames = []
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
@@ -48,24 +47,17 @@ def load_keywords(keywords_file):
         print(f"Error loading keywords: {e}")
         return []
 
-# Function to load blacklist or whitelist of file extensions from a specified file
-def load_extensions(extensions_file):
-    """Load extensions from the specified file."""
-    try:
-        with open(extensions_file, 'r') as ef:
-            return tuple(line.strip().lower() for line in ef.readlines())
-    except Exception as e:
-        print(f"Error loading extensions: {e}")
-        return ()
 
 def search_in_text(text, keywords):
-    """Search for keywords in the text, return the keyword if found."""
+    """Search for keywords in the text, return a list of tuples for all matches."""
+    matches = []
     for keyword in keywords:
-        # Locate the keyword in the text
         keyword_pos = text.lower().find(keyword.lower())
-        if keyword_pos != -1:
-            return (keyword,keyword_pos)
-    return None
+        while keyword_pos != -1:
+            matches.append((keyword, keyword_pos))
+            keyword_pos = text.lower().find(keyword.lower(), keyword_pos + len(keyword))
+    return matches
+
 
 def create_snippet(text, keyword_tuple):
     """Generate a snippet around a keyword with up to 50 characters and at most 1 line before and 1 line after,
@@ -96,358 +88,324 @@ def create_snippet(text, keyword_tuple):
     return highlighted_snippet
 
 
-# Function to handle text files
-def handle_text_file(file_path, keywords):
-    """Read and search in text files."""
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
-            file_data = file.read()
-            keyword =  search_in_text(file_data, keywords)
-            if keyword:
-                if out:
-                    snippet = create_snippet(file_data, keyword)
-                    print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-                return file_path
-    except Exception as e:
-        debug_print(f"Skipping text file {file_path} due to error: {e}")
-    return None
+def copy_file_to_download_folder(file_path):
+    """Copy file to the downloaded folder and avoid overwriting files with the same name."""
+    base_name = os.path.basename(file_path)
+    dest_path = os.path.join(download_folder, base_name)
+    
+    # Check if the file already exists in the download folder and rename it if necessary
+    counter = 1
+    while os.path.exists(dest_path):
+        name, ext = os.path.splitext(base_name)
+        dest_path = os.path.join(download_folder, f"{name}_{counter}{ext}")
+        counter += 1
+    
+    shutil.copy(file_path, dest_path)
+    return dest_path
+
 
 # Function to handle PDF files
-def handle_pdf_file(file_path, keywords):
+def handle_pdf_file(file_path, keywords, limit=10):
     """Read and search in PDF files."""
+    snippets = []
     try:
         with pdfplumber.open(file_path) as pdf:
+            match_count = 0  # Counter for number of matches
             for page in pdf.pages:
                 text = page.extract_text()
-                keyword = search_in_text(text, keywords)
-                if keyword:
-                    if out:
-                        snippet = create_snippet(text, keyword)
-                        print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-                    return file_path
+                matches = search_in_text(text, keywords)
+                for match in matches:
+                    if match_count >= limit:
+                        break
+                    snippet = create_snippet(text, match)
+                    if snippet:
+                        snippets.append(snippet)
+                        match_count += 1
+                if match_count >= limit:
+                    break
+        if snippets:
+            copied_file = copy_file_to_download_folder(file_path)
+            json_report[copied_file] = {
+                "original_path": file_path,
+                "snippets": snippets
+            }
+            print(f"{BOLD_TEXT}{PURPLE_TEXT}{file_path}{RESET_TEXT}:")
+            for snippet in snippets:
+                print(f"{snippet}\n")
     except Exception as e:
         debug_print(f"Skipping PDF file {file_path} due to error: {e}")
-    return None
+    return snippets
+
 
 # Function to handle .docx files
-def handle_docx_file(file_path, keywords):
+def handle_docx_file(file_path, keywords, limit=10):
     """Read and search in .docx files."""
+    snippets = []
     try:
         doc = Document(file_path)
         text = ""
         for para in doc.paragraphs:
             text += para.text
-        keyword = search_in_text(text, keywords)
-        if keyword:
-            if out:
-                snippet = create_snippet(text, keyword)
-                print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-            return file_path
+        match_count = 0  # Counter for number of matches
+        matches = search_in_text(text, keywords)
+        for match in matches:
+            if match_count >= limit:
+                break
+            snippet = create_snippet(text, match)
+            if snippet:
+                snippets.append(snippet)
+                match_count += 1
+        if snippets:
+            copied_file = copy_file_to_download_folder(file_path)
+            json_report[copied_file] = {
+                "original_path": file_path,
+                "snippets": snippets
+            }
+            print(f"{BOLD_TEXT}{PURPLE_TEXT}{file_path}{RESET_TEXT}:")
+            for snippet in snippets:
+                print(f"{snippet}\n")
     except Exception as e:
         debug_print(f"Skipping .docx file {file_path} due to error: {e}")
-    return None
+    return snippets
+
 
 # Function to handle .xlsx files
-def handle_xlsx_file(file_path, keywords):
+def handle_xlsx_file(file_path, keywords, limit=10):
     """Read and search in .xlsx files."""
+    snippets = []
     try:
         wb = openpyxl.load_workbook(file_path)
+        match_count = 0  # Counter for number of matches
         for sheet in wb.sheetnames:
             ws = wb[sheet]
             for row in ws.iter_rows(values_only=True):
                 for cell in row:
-                    keyword = search_in_text(str(cell), keywords)
-                    if keyword:
-                        if out:
-                            snippet = create_snippet(str(cell), keyword)
-                            print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-                        return file_path
+                    if match_count >= limit:
+                        break
+                    matches = search_in_text(str(cell), keywords)
+                    for match in matches:
+                        if match_count >= limit:
+                            break
+                        snippet = create_snippet(str(cell), match)
+                        if snippet:
+                            snippets.append(snippet)
+                            match_count += 1
+                if match_count >= limit:
+                    break
+            if match_count >= limit:
+                break
+        if snippets:
+            copied_file = copy_file_to_download_folder(file_path)
+            json_report[copied_file] = {
+                "original_path": file_path,
+                "snippets": snippets
+            }
+            print(f"{BOLD_TEXT}{PURPLE_TEXT}{file_path}{RESET_TEXT}:")
+            for snippet in snippets:
+                print(f"{snippet}\n")
     except Exception as e:
         debug_print(f"Skipping .xlsx file {file_path} due to error: {e}")
-    return None
+    return snippets
+
 
 # Function to handle .pptx files
-def handle_pptx_file(file_path, keywords):
+def handle_pptx_file(file_path, keywords, limit=10):
     """Read and search in .pptx files."""
+    snippets = []
     try:
         prs = Presentation(file_path)
+        match_count = 0  # Counter for number of matches
         for slide in prs.slides:
             for shape in slide.shapes:
                 if hasattr(shape, "text"):
-                    keyword = search_in_text(shape.text, keywords)
-                    if keyword:
-                        if out:
-                            snippet = create_snippet(shape.text, keyword)
-                            print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-                        return file_path
+                    if match_count >= limit:
+                        break
+                    matches = search_in_text(shape.text, keywords)
+                    for match in matches:
+                        if match_count >= limit:
+                            break
+                        snippet = create_snippet(shape.text, match)
+                        if snippet:
+                            snippets.append(snippet)
+                            match_count += 1
+                if match_count >= limit:
+                    break
+            if match_count >= limit:
+                break
+        if snippets:
+            copied_file = copy_file_to_download_folder(file_path)
+            json_report[copied_file] = {
+                "original_path": file_path,
+                "snippets": snippets
+            }
+            print(f"{BOLD_TEXT}{PURPLE_TEXT}{file_path}{RESET_TEXT}:")
+            for snippet in snippets:
+                print(f"{snippet}\n")
     except Exception as e:
         debug_print(f"Skipping .pptx file {file_path} due to error: {e}")
-    return None
+    return snippets
 
 
 # Handle .odt files
-def handle_odt_file(file_path, keywords):
+def handle_odt_file(file_path, keywords, limit=10):
     """Read and search in .odt files."""
+    snippets = []
     try:
         doc = load_odt(file_path)
-        paragraphs = [element.textContent for element in doc.getElementsByType(P)]
-        text = " ".join(paragraphs)
-        keyword = search_in_text(text, keywords)
-        if keyword:
-            if out:
-                snippet = create_snippet(text, keyword)
-                print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-            return file_path
+        text = ""
+        for paragraph in doc.getElementsByType(P):
+            text += paragraph.text
+        match_count = 0  # Counter for number of matches
+        matches = search_in_text(text, keywords)
+        for match in matches:
+            if match_count >= limit:
+                break
+            snippet = create_snippet(text, match)
+            if snippet:
+                snippets.append(snippet)
+                match_count += 1
+        if snippets:
+            copied_file = copy_file_to_download_folder(file_path)
+            json_report[copied_file] = {
+                "original_path": file_path,
+                "snippets": snippets
+            }
+            print(f"{BOLD_TEXT}{PURPLE_TEXT}{file_path}{RESET_TEXT}:")
+            for snippet in snippets:
+                print(f"{snippet}\n")
     except Exception as e:
         debug_print(f"Skipping .odt file {file_path} due to error: {e}")
-    return None
+    return snippets
 
-# Handle .ppt files
-def handle_ppt_file(file_path, keywords):
-    """Read and search in .ppt files using python-pptx."""
-    try:
-        prs = Presentation(file_path)
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    keyword = search_in_text(shape.text, keywords)
-                    if keyword:
-                        if out:
-                            snippet = create_snippet(shape.text, keyword)
-                            print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-                        return file_path
-    except Exception as e:
-        debug_print(f"Skipping .ppt file {file_path} due to error: {e}")
-    return None
+def handle_interesting_filename(file_path, keywords, limit):
+    interesting_filenames.append(file_path)
+    
 
-# Handle .doc files
-def handle_doc_file(file_path, keywords):
-    """Read and search in .doc files using python-docx."""
-    try:
-        doc = Document(file_path)
-        text = ""
-        for para in doc.paragraphs:
-            text += para.text
-        keyword = search_in_text(text, keywords)
-        if keyword:
-            if out:
-                snippet = create_snippet(text, keyword)
-                print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-            return file_path
-    except Exception as e:
-        debug_print(f"Skipping .doc file {file_path} due to error: {e}")
-    return None
+# List of handler functions for each extension
+file_handlers = {
+    '.pdf': handle_pdf_file,
+    '.docx': handle_docx_file,
+    '.xlsx': handle_xlsx_file,
+    '.pptx': handle_pptx_file,
+    '.odt': handle_odt_file,
+    '.wim': handle_interesting_filename,
+    '.kdbx': handle_interesting_filename,
+}
 
-# Handle .xls files using xlrd
-def handle_xls_file(file_path, keywords):
-    """Read and search in .xls files."""
-    try:
-        workbook = xlrd.open_workbook(file_path)
-        for sheet in workbook.sheets():
-            for row_idx in range(sheet.nrows):
-                row = sheet.row(row_idx)
-                for cell in row:
-                    keyword = search_in_text(str(row), keywords)
-                    if keyword:
-                        if out:
-                            snippet = create_snippet(str(row), keyword)
-                            print(f"{BOLD_TEXT}{file_path}{RESET_TEXT}:\n{snippet}\n")
-                        return file_path
-    except Exception as e:
-        debug_print(f"Skipping .xls file {file_path} due to error: {e}")
-    return None
-
-# Function to check if the file should be processed based on its extension
-def is_supported_file(file_path, extensions, use_whitelist):
-    """Check if the file should be processed based on its extension."""
-    if use_whitelist:
-        return file_path.lower().endswith(extensions)
-    else:
-        return not file_path.lower().endswith(extensions)
 
 # Function to handle files based on their type
-def handle_file(file_path, keywords, extensions, use_whitelist):
-    """Determine file type and search."""
-    if is_supported_file(file_path, extensions, use_whitelist):
-        if file_path.lower().endswith('.pdf'):
-            return handle_pdf_file(file_path, keywords)
-        elif file_path.lower().endswith('.docx'):
-            return handle_docx_file(file_path, keywords)
-        elif file_path.lower().endswith('.xlsx'):
-            return handle_xlsx_file(file_path, keywords)
-        elif file_path.lower().endswith('.pptx'):
-            return handle_pptx_file(file_path, keywords)
-        elif file_path.lower().endswith('.odt'):
-            return handle_odt_file(file_path, keywords)
-        elif file_path.lower().endswith('.ppt'):
-            return handle_ppt_file(file_path, keywords)
-        elif file_path.lower().endswith('.xls'):
-            return handle_xls_file(file_path, keywords)
-        elif file_path.lower().endswith('.doc'):
-            return handle_doc_file(file_path, keywords)
-        else:
-            return handle_text_file(file_path, keywords)
+def handle_file(file_path, keywords, limit):
+    """Determine file type and search for keywords."""
+    extension = os.path.splitext(file_path)[1].lower()
+    handler = file_handlers.get(extension)
+    
+    if handler:
+        return handler(file_path, keywords, limit)
     else:
-        debug_print(f"Ignoring unsupported file type: {file_path}")
+        debug_print(f"No handler for {file_path}")
     return None
 
-# Create a metadata dictionary to keep track of original paths
-metadata = {}
 
-# Function to ensure the filename is unique in the download folder
-def ensure_unique_filename(original_name):
-    """Ensure the filename is unique by appending a number if necessary."""
-    base, ext = os.path.splitext(original_name)
-    count = 1
-    new_name = original_name
-    while os.path.exists(os.path.join(download_folder, new_name)):
-        new_name = f"{base}_{count}{ext}"  # Append a counter to the filename
-        count += 1
-    return new_name
+# Main function to scan the directory with multi-threading
+def scan_directory(directory, keywords, limit):
+    """Scan the directory for files and search for keywords using multi-threading."""
+    matched_files = []
 
-# Function to copy the found file to the download folder while logging its original path
-def copy_file(file_path):
-    """Copy the found file to the download folder while logging its original path."""
-    try:
-        # Get the original file name
-        original_name = os.path.basename(file_path)  # Get only the filename without path
+    # Use ThreadPoolExecutor to handle files in parallel
+    with ThreadPoolExecutor() as executor:
+        futures = []
         
-        # Ensure a unique filename
-        safe_filename = ensure_unique_filename(original_name)  
+        for root, _, files in os.walk(directory):
+            for file in files:
+                file_path = os.path.join(root, file)
+                futures.append(executor.submit(handle_file, file_path, keywords, limit))
         
-        # Set the destination path
-        destination_path = os.path.join(download_folder, safe_filename)
+        # Process results
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                matched_files.append(result)
 
-        # Copy the file to the destination path
-        shutil.copy(file_path, destination_path)
-
-        # Log the original path in the metadata JSON file (Assuming log_metadata is implemented)
-        log_metadata(safe_filename, file_path)
-
-        debug_print(f"Copied {file_path} to {destination_path}")
-    except Exception as e:
-        debug_print(f"Error copying file {file_path}: {e}")
+    return matched_files
 
 
-# Function to log metadata to JSON file
-def log_metadata(filename, original_path):
-    """Log the original path of the copied file in the metadata JSON."""
-    metadata_entry = {filename: original_path}
-
-    # Open the metadata file in append mode
-    metadata_file_path = os.path.join(script_dir, f'metadata_{timestamp}.json')
-
-    # Check if the metadata file already exists
-    if not os.path.exists(metadata_file_path):
-        # If not, create the file and write an opening bracket for a JSON array
-        with open(metadata_file_path, 'w') as f:
-            f.write('[\n')
-
-    # Append the new metadata entry to the JSON file
-    with open(metadata_file_path, 'a') as f:
-        json.dump(metadata_entry, f, indent=4)
-        f.write(',\n')  # Add a comma after each entry
-
-# Function to finalize the metadata JSON file
-def finalize_metadata():
-    """Finalize the metadata JSON file by replacing the last comma with a closing bracket."""
-    metadata_file_path = os.path.join(script_dir, f'metadata_{timestamp}.json')
-    # Read the current content of the file
-    with open(metadata_file_path, 'r+') as f:
-        lines = f.readlines()
-        if len(lines) > 1:
-            # Remove the last comma and add a closing bracket
-            lines[-2] = lines[-2].rstrip(',\n') + '\n'  # Remove the last comma
-            lines.append(']\n')  # Add the closing bracket
-            f.seek(0)  # Move to the beginning of the file
-            f.writelines(lines)  # Write the modified lines back to the file
-            f.truncate()  # Truncate the file to the new size
-            
-# Function to process files in a directory using os.scandir()
-def file_generator(mount_directory, queue):
-    """Yield file paths in the directory and put them into the queue."""
-    try:
-        for entry in os.scandir(mount_directory):
-            if entry.is_file():
-                queue.put(entry.path)
-            elif entry.is_dir():  # Recursively traverse subdirectories
-                file_generator(entry.path, queue)
-    except Exception as e:
-        debug_print(f"Error accessing {mount_directory}: {e}")
-
-# Function to process files from the queue
-def process_files(queue, keywords, extensions, use_whitelist):
-    """Worker function to process files from the queue."""
-    while True:
-        file_path = queue.get()
-        if file_path is None:  # Stop signal
-            break
-        result = handle_file(file_path, keywords, extensions, use_whitelist)
-        if result:
-            copy_file(result)
-        queue.task_done()
-
-# Function to search and copy files using multithreading
-def search_and_copy_files(mount_directory, keywords, extensions, use_whitelist):
-    """Search and copy files using multithreading."""
-    # Create a queue to hold file paths
-    queue = Queue()
-
-    # Create threads for processing files
-    threads = []
-    for _ in range(os.cpu_count()):  # Use the number of CPU cores
-        thread = threading.Thread(target=process_files, args=(queue, keywords, extensions, use_whitelist))
-        thread.start()
-        threads.append(thread)
-
-    # Start listing files and putting them into the queue
-    file_generator(mount_directory, queue)
-
-    # Wait for the queue to finish processing
-    queue.join()
-
-    # Stop workers
-    for _ in threads:
-        queue.put(None)  # Sending stop signal to workers
-    for thread in threads:
-        thread.join()
-    
-    # Finalize the metadata JSON file
-    finalize_metadata()
-
-# Function for debug printing
 def debug_print(message):
-    """Print debug messages if debugging is enabled."""
+    """Print debug messages if in debug mode."""
     if debug:
-        print(message)
+        print(f"{RED_TEXT}{message}{RESET_TEXT}")
 
-# Main function for argument parsing and execution
-def main():
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='Search files for specific keywords and copy them.')
-    parser.add_argument('--shares', required=True, type=str, help='Path to the directory containing mounted shares.')
-    parser.add_argument('--keywords', type=str, help='Path to the file containing keywords.', default=default_keywords_path)
-    parser.add_argument('--extensions', type=str, help='Path to the file containing extensions (blacklist or whitelist).', default=default_extensions_path)
-    parser.add_argument('--whitelist', action='store_true', help='Use the provided extensions as a whitelist instead of a blacklist.')
-    parser.add_argument('--debug', action='store_true', help='Enable debug output.')
-    parser.add_argument('--out', action='store_true', help='Print keyword identified.')
 
-    # Parse arguments
+
+def analyze_occurrences_in_report(report_file_path, model_name="artifish/llama3.2-uncensored"):
+    # Open and load the JSON report
+    with open(report_file_path, "r", encoding="utf-8") as file:
+        report_data = json.load(file)
+
+
+    # Iterate over the entries in the report data (assuming the structure is similar to the example provided)
+    for file_path, file_data in report_data.items():
+        if 'snippets' in file_data:
+            for snippet in file_data['snippets']:
+                # Assuming the snippet is a text containing the occurrence we want to analyze
+                occurrence_text = snippet  # Assuming text after the colon is the occurrence text
+
+                # Format the occurrence text for the analysis
+                formatted_text = f"{{{{{occurrence_text}}}}}"
+
+                message_content = (
+                    f"does the following text contain credentials? \nAnswer with the following format\n if no password : OK\n if only password: pass=the password\n if password and user user=password\nHere is the text:\n {formatted_text}"
+                )
+
+                # Send the request to the AI model
+                response = ollama.chat(model=model_name, messages=[{"role": "user", "content": message_content}])
+
+                result = response['message']['content'].strip()
+                print(result)
+
+
+
+# Get the directory of the script
+script_directory = os.path.dirname(os.path.realpath(__file__))
+default_keywords_file = os.path.join(script_directory, "keywords.txt")
+
+# Main entry point for the script
+if __name__ == "__main__":
+    # Set up argument parsing
+    parser = argparse.ArgumentParser(description="Search files for keywords")
+    parser.add_argument("directory", help="Directory to scan for files")
+    parser.add_argument("--keywords", help="File containing keywords", default=default_keywords_file)
+    parser.add_argument("--debug", help="Enable debug mode", action="store_true")
+    parser.add_argument("--limit", type=int, default=10, help="Limit number of keyword matches per file")
+    parser.add_argument("--nollm", help="Disable llm", action="store_true")
+    parser.add_argument("--json", default=None, help="Specify a json report, and treat it with llm")
+
     args = parser.parse_args()
 
-    global debug
-    debug = args.debug  # Set global debug variable
-    global out
-    out = args.out
+    debug = args.debug
 
-    # Load keywords and extensions
-    keywords = load_keywords(args.keywords)
-    extensions = load_extensions(args.extensions)
+    if not args.json:
+        # Load keywords
+        keywords_file = args.keywords if os.path.isfile(args.keywords) else "keywords.txt"
+        keywords = load_keywords(keywords_file)
 
-    # Run the search and copy
-    search_and_copy_files(args.shares, keywords, extensions, args.whitelist)
-    print(f"Search completed. Files containing keywords are saved in '{download_folder}'.")
+        # Scan the directory for files containing the keywords
+        matched_files = scan_directory(args.directory, keywords, args.limit)
 
-# Run the script
-if __name__ == '__main__':
-    main()
+        # Write the JSON report
+        json_report_path = os.path.join(download_folder, "report.json")
+        with open(json_report_path, "w") as json_file:
+            json.dump(json_report, json_file, indent=4)
+
+        print(f"\n{BOLD_TEXT}Interesting filenames:{RESET_TEXT}")
+        for filename in interesting_filenames:
+            print(filename)
+
+        print(f"\nJSON report saved to {json_report_path}")
+    
+    if not args.nollm:
+        if args.json:
+            report_path = args.json
+        else:
+            report_path = json_report_path
+        analyze_occurrences_in_report(report_path)
+
